@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -13,84 +14,329 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController controller = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
-  final List<Map<String, dynamic>> messages = [
-    {
-      "text":
-          "Hello! I'm your SmartTraffic assistant. How can I help you navigate today?",
-      "isUser": false
-    },
-  ];
-
+  List<Map<String, dynamic>> messages = [];
+  String? currentConversationId;
+  String? currentUserId;
+  List<Map<String, dynamic>> conversationsList = [];
   bool loading = false;
+  bool isLoadingHistory = true;
+  bool showSidebar = false;
+  bool _isSending = false;
+
+  final String apiBase = 'https://chatbox-lor.onrender.com/api';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadUser();
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadUser() async {
+    final prefs = await SharedPreferences.getInstance();
+    final userStr = prefs.getString('user');
+    if (userStr != null) {
+      final user = jsonDecode(userStr);
+      currentUserId = user['id'] ?? user['_id'];
+      await _loadConversationsList();
+    }
+  }
+
+  Future<void> _loadConversationsList() async {
+    if (currentUserId == null) return;
+
+    try {
+      final response = await http
+          .get(
+            Uri.parse('$apiBase/conversations/$currentUserId'),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200 && mounted) {
+        final List data = jsonDecode(response.body);
+        setState(() {
+          conversationsList = data
+              .map((conv) => {
+                    '_id': conv['_id'],
+                    'title': conv['title'] ?? 'New Chat',
+                    'createdAt': conv['createdAt'],
+                  })
+              .toList();
+        });
+      }
+    } catch (e) {
+      print('Error loading conversations: $e');
+    }
+  }
+
+  Future<void> _loadHistory(String convId) async {
+    if (convId.isEmpty) return;
+
+    if (mounted) {
+      setState(() => isLoadingHistory = true);
+    }
+
+    try {
+      final response = await http
+          .get(
+            Uri.parse('$apiBase/history/$convId'),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200 && mounted) {
+        final List data = jsonDecode(response.body);
+        if (data.isNotEmpty) {
+          final formatted = data
+              .map((m) => ({
+                    'text': m['content'],
+                    'isUser': m['role'] == 'user',
+                    'timestamp': _formatTime(DateTime.parse(m['timestamp'])),
+                  }))
+              .toList();
+          setState(() => messages = formatted);
+        } else {
+          setState(() => messages = []);
+        }
+      } else if (response.statusCode == 404 && mounted) {
+        setState(() => messages = []);
+      }
+    } catch (e) {
+      print('Error loading history: $e');
+      if (mounted) setState(() => messages = []);
+    } finally {
+      if (mounted) setState(() => isLoadingHistory = false);
+    }
+  }
+
+  Future<void> sendMessage() async {
+    if (controller.text.trim().isEmpty || loading || _isSending) return;
+
+    final userMessage = controller.text.trim();
+    final timestamp = _formatTime(DateTime.now());
+
+    final newUserMessage = {
+      'text': userMessage,
+      'isUser': true,
+      'timestamp': timestamp,
+    };
+
+    if (mounted) {
+      setState(() {
+        messages.add(newUserMessage);
+        controller.clear();
+        loading = true;
+        _isSending = true;
+      });
+    }
+
+    _scrollToBottom();
+
+    try {
+      String convId = currentConversationId ?? '';
+      final isNewConversation = convId.isEmpty;
+
+      if (isNewConversation) {
+        convId = 'conv_${DateTime.now().millisecondsSinceEpoch}';
+      }
+
+      final response = await http
+          .post(
+            Uri.parse('$apiBase/chat'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'message': userMessage,
+              'conversationId': convId,
+              'userId': currentUserId,
+            }),
+          )
+          .timeout(const Duration(seconds: 30));
+
+      final data = jsonDecode(response.body);
+
+      if (response.statusCode == 200 && mounted) {
+        final botReply = data['reply'] ?? 'No response';
+        final newBotMessage = {
+          'text': botReply,
+          'isUser': false,
+          'timestamp': _formatTime(DateTime.now()),
+        };
+
+        setState(() {
+          messages.add(newBotMessage);
+
+          if (isNewConversation) {
+            currentConversationId = convId;
+            _loadConversationsList();
+          }
+        });
+
+        _scrollToBottom();
+      } else if (mounted) {
+        setState(() {
+          messages.removeLast();
+          messages.add({
+            'text': data['error'] ?? 'Server error: ${response.statusCode}',
+            'isUser': false,
+            'timestamp': timestamp,
+          });
+        });
+      }
+    } catch (e) {
+      print('Chat error: $e');
+      if (mounted) {
+        setState(() {
+          messages.removeLast();
+          messages.add({
+            'text': '❌ Cannot connect to server. Please try again.',
+            'isUser': false,
+            'timestamp': timestamp,
+          });
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          loading = false;
+          _isSending = false;
+        });
+      }
+      _scrollToBottom();
+    }
+  }
+
+  void _createNewConversation() {
+    if (mounted) {
+      setState(() {
+        messages = [];
+        currentConversationId = null;
+        showSidebar = false;
+      });
+    }
+  }
+
+  void _loadConversation(Map<String, dynamic> conv) {
+    if (mounted) {
+      setState(() {
+        currentConversationId = conv['_id'];
+        showSidebar = false;
+      });
+    }
+    _loadHistory(conv['_id']);
+  }
+
+  Future<void> _deleteConversation(String convId) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete Conversation'),
+        content:
+            const Text('Are you sure you want to delete this conversation?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    try {
+      final response = await http
+          .delete(
+            Uri.parse('$apiBase/conversations/$convId'),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200 && mounted) {
+        await _loadConversationsList();
+
+        if (convId == currentConversationId) {
+          if (conversationsList.isNotEmpty) {
+            final nextConv = conversationsList.firstWhere(
+              (c) => c['_id'] != convId,
+              orElse: () =>
+                  conversationsList.isNotEmpty ? conversationsList.first : {},
+            );
+            if (nextConv.isNotEmpty) {
+              _loadConversation(nextConv);
+            } else {
+              _createNewConversation();
+            }
+          } else {
+            _createNewConversation();
+          }
+        }
+      }
+    } catch (e) {
+      print('Error deleting conversation: $e');
+    }
+  }
+
+  Future<void> _clearCurrentChat() async {
+    if (currentConversationId == null) return;
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clear Chat'),
+        content: const Text(
+            'Are you sure you want to clear all messages in this conversation?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Clear', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    try {
+      final response = await http
+          .delete(
+            Uri.parse('$apiBase/history/$currentConversationId'),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200 && mounted) {
+        setState(() => messages = []);
+      }
+    } catch (e) {
+      print('Error clearing chat: $e');
+    }
+  }
+
+  String _formatTime(DateTime time) {
+    return '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';
+  }
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
+          duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
         );
       }
     });
-  }
-
-  Future<void> sendMessage() async {
-    if (controller.text.trim().isEmpty) return;
-
-    final userText = controller.text.trim();
-
-    setState(() {
-      messages.add({"text": userText, "isUser": true});
-      loading = true;
-    });
-
-    controller.clear();
-    _scrollToBottom();
-
-    try {
-      final apiMessages = messages.map((m) {
-        return {
-          "role": m["isUser"] ? "user" : "assistant",
-          "content": m["text"],
-        };
-      }).toList();
-
-      final response = await http.post(
-        Uri.parse("https://chatbox-lor.onrender.com/api/chat"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"messages": apiMessages}),
-      );
-
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        final botReply =
-            data["choices"][0]["message"]["content"] ?? "No response";
-
-        setState(() {
-          messages.add({"text": botReply, "isUser": false});
-        });
-      } else {
-        setState(() {
-          messages.add({
-            "text": "Server error: ${response.statusCode}",
-            "isUser": false
-          });
-        });
-      }
-    } catch (e) {
-      setState(() {
-        messages.add({
-          "text": "❌ Cannot connect to server. Please try again.",
-          "isUser": false
-        });
-      });
-    } finally {
-      setState(() {
-        loading = false;
-      });
-      _scrollToBottom();
-    }
   }
 
   void _handleQuickAction(String action) {
@@ -114,172 +360,255 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFF7F5F8),
-      body: Container(
-        width: double.infinity,
-        height: double.infinity,
-        margin: EdgeInsets.only(top: MediaQuery.of(context).padding.top),
-        decoration: BoxDecoration(
-          color: const Color(0xFFF7F5F8),
-          border: Border(
-            left: BorderSide(color: const Color(0xFF7B00FF).withOpacity(0.1)),
-            right: BorderSide(color: const Color(0xFF7B00FF).withOpacity(0.1)),
-          ),
-        ),
+      body: SafeArea(
         child: Column(
           children: [
-            // Header - Giống HTML
+            // Header
             Container(
               color: Colors.white,
-              child: Column(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
                 children: [
-                  const SizedBox(height: 8),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Row(
+                  GestureDetector(
+                    onTap: () => setState(() => showSidebar = !showSidebar),
+                    child: const Icon(Icons.menu, color: Color(0xFF7B00FF)),
+                  ),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Column(
                       children: [
-                        // Back button
-                        GestureDetector(
-                          onTap: () => Navigator.pop(context),
-                          child: Container(
-                            width: 40,
-                            height: 40,
-                            decoration: const BoxDecoration(
-                              shape: BoxShape.circle,
-                            ),
-                            child: const Icon(
-                              Icons.arrow_back,
-                              color: Color(0xFF7B00FF),
-                            ),
+                        Text(
+                          "Traffic Assistant",
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
-
-                        // Title and status
-                        Expanded(
-                          child: Column(
-                            children: [
-                              const Text(
-                                "Traffic Assistant",
-                                style: TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.bold,
-                                ),
+                        SizedBox(height: 4),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.circle, size: 8, color: Colors.green),
+                            SizedBox(width: 6),
+                            Text(
+                              "ONLINE",
+                              style: TextStyle(
+                                color: Color(0xFF7B00FF),
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
                               ),
-                              const SizedBox(height: 4),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Container(
-                                    width: 8,
-                                    height: 8,
-                                    decoration: const BoxDecoration(
-                                      color: Colors.green,
-                                      shape: BoxShape.circle,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  const Text(
-                                    "ONLINE",
-                                    style: TextStyle(
-                                      color: Color(0xFF7B00FF),
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      letterSpacing: 0.5,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-
-                        // More button
-                        Container(
-                          width: 40,
-                          height: 40,
-                          decoration: const BoxDecoration(
-                            shape: BoxShape.circle,
-                          ),
-                          child: const Icon(
-                            Icons.more_vert,
-                            color: Colors.grey,
-                          ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
                   ),
-                  const SizedBox(height: 8),
+                  GestureDetector(
+                    onTap: _createNewConversation,
+                    child: const Icon(Icons.add_comment, color: Colors.grey),
+                  ),
+                  const SizedBox(width: 8),
+                  if (currentConversationId != null && messages.isNotEmpty)
+                    GestureDetector(
+                      onTap: _clearCurrentChat,
+                      child: const Icon(Icons.delete_sweep, color: Colors.grey),
+                    ),
                 ],
               ),
             ),
 
-            // Chat Area
+            // Main content
             Expanded(
-              child: Container(
-                color: const Color(0xFFF7F5F8),
-                child: ListView.builder(
-                  controller: _scrollController,
-                  padding: const EdgeInsets.all(16),
-                  itemCount: messages.length,
-                  itemBuilder: (context, index) {
-                    final msg = messages[index];
-                    final isUser = msg["isUser"];
+              child: Stack(
+                children: [
+                  // Chat area
+                  isLoadingHistory && currentConversationId != null
+                      ? const Center(
+                          child: CircularProgressIndicator(
+                              color: Color(0xFF7B00FF)))
+                      : messages.isEmpty
+                          ? _buildEmptyState()
+                          : ListView.builder(
+                              controller: _scrollController,
+                              padding: const EdgeInsets.all(16),
+                              itemCount: messages.length,
+                              itemBuilder: (context, index) {
+                                final msg = messages[index];
+                                final isUser = msg['isUser'] == true;
+                                return isUser
+                                    ? _buildUserMessage(msg['text'])
+                                    : _buildBotMessage(msg['text'], index == 0);
+                              },
+                            ),
 
-                    return isUser
-                        ? _buildUserMessage(msg["text"])
-                        : _buildBotMessage(msg["text"], index == 0);
-                  },
-                ),
+                  // Loading indicator - ở dưới cùng
+                  if (loading)
+                    Positioned(
+                      bottom: 16,
+                      left: 0,
+                      right: 0,
+                      child: Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 16, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF7B00FF),
+                            borderRadius: BorderRadius.circular(20),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.1),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              SizedBox(width: 8),
+                              Text(
+                                "Thinking...",
+                                style: TextStyle(
+                                    color: Colors.white, fontSize: 12),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  // Sidebar - hiển thị trên cùng
+                  if (showSidebar)
+                    GestureDetector(
+                      onTap: () => setState(() => showSidebar = false),
+                      child: Container(
+                        color: Colors.black54,
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: Container(
+                            width: 280,
+                            height: double.infinity,
+                            color: Colors.white,
+                            child: Column(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(16),
+                                  decoration: const BoxDecoration(
+                                    border: Border(
+                                      bottom: BorderSide(
+                                          color: Color(0xFF7B00FF), width: 0.5),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      const Text(
+                                        'Chat History',
+                                        style: TextStyle(
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.bold,
+                                          color: Color(0xFF7B00FF),
+                                        ),
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(Icons.close),
+                                        onPressed: () =>
+                                            setState(() => showSidebar = false),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Expanded(
+                                  child: ListView.builder(
+                                    itemCount: conversationsList.length,
+                                    itemBuilder: (context, index) {
+                                      final conv = conversationsList[index];
+                                      final isActive =
+                                          conv['_id'] == currentConversationId;
+                                      return ListTile(
+                                        leading: Icon(
+                                          Icons.chat_bubble_outline,
+                                          color: isActive
+                                              ? const Color(0xFF7B00FF)
+                                              : Colors.grey,
+                                        ),
+                                        title: Text(
+                                          conv['title'] ?? 'New Chat',
+                                          style: TextStyle(
+                                            fontWeight: isActive
+                                                ? FontWeight.bold
+                                                : FontWeight.normal,
+                                            color: isActive
+                                                ? const Color(0xFF7B00FF)
+                                                : Colors.black87,
+                                          ),
+                                        ),
+                                        subtitle: Text(
+                                          _formatTime(DateTime.parse(
+                                              conv['createdAt'])),
+                                          style: const TextStyle(fontSize: 10),
+                                        ),
+                                        trailing: IconButton(
+                                          icon: const Icon(Icons.delete,
+                                              color: Colors.red),
+                                          onPressed: () =>
+                                              _deleteConversation(conv['_id']),
+                                        ),
+                                        onTap: () => _loadConversation(conv),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
 
-            // Loading indicator
-            if (loading)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 8),
-                child: Text(
-                  "Thinking...",
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Color(0xFF7B00FF),
-                  ),
-                ),
-              ),
-
-            // Bottom Controls
+            // Bottom input
             Container(
               padding: const EdgeInsets.all(16),
               color: Colors.white,
               child: Column(
                 children: [
-                  // Quick Action Menu
                   SingleChildScrollView(
                     scrollDirection: Axis.horizontal,
                     child: Row(
                       children: [
                         _buildQuickActionButton(
                           icon: Icons.warning_amber_rounded,
-                          label: "Accidents nearby",
+                          label: "Accidents",
                           onTap: () => _handleQuickAction("accidents"),
                         ),
                         const SizedBox(width: 8),
                         _buildQuickActionButton(
                           icon: Icons.videocam,
-                          label: "Camera feed",
+                          label: "Cameras",
                           onTap: () => _handleQuickAction("camera"),
                         ),
                         const SizedBox(width: 8),
                         _buildQuickActionButton(
                           icon: Icons.ev_station,
-                          label: "Charging stations",
+                          label: "Charging",
                           onTap: () => _handleQuickAction("charging"),
                         ),
                       ],
                     ),
                   ),
-
                   const SizedBox(height: 12),
-
-                  // Input Area
                   Container(
                     padding:
                         const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -287,8 +616,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       color: const Color(0xFFF7F5F8),
                       borderRadius: BorderRadius.circular(8),
                       border: Border.all(
-                        color: const Color(0xFF7B00FF).withOpacity(0.1),
-                      ),
+                          color: const Color(0xFF7B00FF).withOpacity(0.1)),
                     ),
                     child: Row(
                       children: [
@@ -313,20 +641,9 @@ class _ChatScreenState extends State<ChatScreen> {
                             decoration: BoxDecoration(
                               color: const Color(0xFF7B00FF),
                               borderRadius: BorderRadius.circular(8),
-                              boxShadow: [
-                                BoxShadow(
-                                  color:
-                                      const Color(0xFF7B00FF).withOpacity(0.3),
-                                  blurRadius: 8,
-                                  offset: const Offset(0, 2),
-                                ),
-                              ],
                             ),
-                            child: const Icon(
-                              Icons.send,
-                              color: Colors.white,
-                              size: 18,
-                            ),
+                            child: const Icon(Icons.send,
+                                color: Colors.white, size: 18),
                           ),
                         ),
                       ],
@@ -337,6 +654,39 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyState() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Container(
+            width: 80,
+            height: 80,
+            decoration: BoxDecoration(
+              color: const Color(0xFF7B00FF).withOpacity(0.1),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(Icons.chat, size: 40, color: Color(0xFF7B00FF)),
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            'Welcome to Traffic Assistant',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 32),
+            child: Text(
+              'Ask me about traffic conditions, accidents, camera feeds, or anything traffic-related!',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -353,17 +703,11 @@ class _ChatScreenState extends State<ChatScreen> {
         decoration: BoxDecoration(
           color: const Color(0xFFF7F5F8),
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: const Color(0xFF7B00FF).withOpacity(0.2),
-          ),
+          border: Border.all(color: const Color(0xFF7B00FF).withOpacity(0.2)),
         ),
         child: Row(
           children: [
-            Icon(
-              icon,
-              size: 16,
-              color: const Color(0xFF7B00FF),
-            ),
+            Icon(icon, size: 16, color: const Color(0xFF7B00FF)),
             const SizedBox(width: 6),
             Text(
               label,
@@ -380,133 +724,56 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildUserMessage(String text) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 16),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: MainAxisAlignment.end,
-        children: [
-          Flexible(
-            child: Container(
-              margin: const EdgeInsets.only(right: 8),
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: const Color(0xFF7B00FF),
-                borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(12),
-                  topRight: Radius.circular(12),
-                  bottomLeft: Radius.circular(12),
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: const Color(0xFF7B00FF).withOpacity(0.2),
-                    blurRadius: 8,
-                    offset: const Offset(0, 2),
-                  ),
-                ],
-              ),
-              child: Text(
-                text,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                ),
-              ),
-            ),
-          ),
-          Container(
-            width: 32,
-            height: 32,
-            decoration: BoxDecoration(
-              color: const Color(0xFF7B00FF),
-              shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xFF7B00FF).withOpacity(0.3),
-                  blurRadius: 8,
-                ),
-              ],
-            ),
-            child: const Icon(
-              Icons.person,
-              color: Colors.white,
-              size: 18,
-            ),
-          ),
-        ],
+    return Align(
+      alignment: Alignment.centerRight,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 16, left: 50),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF7B00FF),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Text(
+          text,
+          style: const TextStyle(color: Colors.white, fontSize: 14),
+        ),
       ),
     );
   }
 
   Widget _buildBotMessage(String text, bool isFirst) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 16),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 32,
-            height: 32,
-            decoration: BoxDecoration(
-              color: const Color(0xFF7B00FF).withOpacity(0.1),
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: const Color(0xFF7B00FF).withOpacity(0.2),
-              ),
-            ),
-            child: const Icon(
-              Icons.smart_toy,
-              color: Color(0xFF7B00FF),
-              size: 18,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (isFirst)
-                  const Padding(
-                    padding: EdgeInsets.only(left: 4, bottom: 4),
-                    child: Text(
-                      "TRAFFIC ASSISTANT",
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF7B00FF),
-                        letterSpacing: 0.5,
-                      ),
-                    ),
-                  ),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: const Color(0xFF7B00FF).withOpacity(0.1),
-                    ),
-                  ),
-                  child: Text(
-                    text,
-                    style: const TextStyle(
-                      color: Colors.black87,
-                      fontSize: 14,
-                    ),
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 16, right: 50),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF7B00FF).withOpacity(0.1)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (isFirst)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 4),
+                child: Text(
+                  "TRAFFIC ASSISTANT",
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF7B00FF),
                   ),
                 ),
-              ],
+              ),
+            Text(
+              text,
+              style: const TextStyle(color: Colors.black87, fontSize: 14),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    controller.dispose();
-    _scrollController.dispose();
-    super.dispose();
   }
 }
