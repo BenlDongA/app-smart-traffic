@@ -1,7 +1,17 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+
+// Top-level function cho compute
+List<dynamic> _parseJson(String responseBody) {
+  return jsonDecode(responseBody);
+}
+
+Map<String, dynamic> _parseJsonMap(String responseBody) {
+  return jsonDecode(responseBody);
+}
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -22,6 +32,9 @@ class _ChatScreenState extends State<ChatScreen> {
   bool isLoadingHistory = true;
   bool showSidebar = false;
   bool _isSending = false;
+
+  // Cache cho history
+  final Map<String, List<Map<String, dynamic>>> _chatCache = {};
 
   final String apiBase = 'https://chatbox-lor.onrender.com/api';
 
@@ -59,7 +72,7 @@ class _ChatScreenState extends State<ChatScreen> {
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200 && mounted) {
-        final List data = jsonDecode(response.body);
+        final List data = await compute(_parseJson, response.body);
         setState(() {
           conversationsList = data
               .map((conv) => {
@@ -78,6 +91,16 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _loadHistory(String convId) async {
     if (convId.isEmpty) return;
 
+    // Kiểm tra cache
+    if (_chatCache.containsKey(convId) && mounted) {
+      setState(() {
+        messages = _chatCache[convId]!;
+        isLoadingHistory = false;
+      });
+      _scrollToBottom();
+      return;
+    }
+
     if (mounted) {
       setState(() => isLoadingHistory = true);
     }
@@ -90,7 +113,7 @@ class _ChatScreenState extends State<ChatScreen> {
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200 && mounted) {
-        final List data = jsonDecode(response.body);
+        final List data = await compute(_parseJson, response.body);
         if (data.isNotEmpty) {
           final formatted = data
               .map((m) => ({
@@ -99,6 +122,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     'timestamp': _formatTime(DateTime.parse(m['timestamp'])),
                   }))
               .toList();
+
+          // Lưu vào cache
+          _chatCache[convId] = formatted;
+
           setState(() => messages = formatted);
         } else {
           setState(() => messages = []);
@@ -126,9 +153,16 @@ class _ChatScreenState extends State<ChatScreen> {
       'timestamp': timestamp,
     };
 
+    // Thêm message user và typing indicator ngay lập tức
     if (mounted) {
       setState(() {
         messages.add(newUserMessage);
+        messages.add({
+          'text': '...',
+          'isUser': false,
+          'timestamp': timestamp,
+          'isTyping': true,
+        });
         controller.clear();
         loading = true;
         _isSending = true;
@@ -157,7 +191,8 @@ class _ChatScreenState extends State<ChatScreen> {
           )
           .timeout(const Duration(seconds: 30));
 
-      final data = jsonDecode(response.body);
+      final Map<String, dynamic> data =
+          await compute(_parseJsonMap, response.body);
 
       if (response.statusCode == 200 && mounted) {
         final botReply = data['reply'] ?? 'No response';
@@ -167,17 +202,32 @@ class _ChatScreenState extends State<ChatScreen> {
           'timestamp': _formatTime(DateTime.now()),
         };
 
+        // Xóa typing indicator và thêm message thật
         setState(() {
+          messages.removeLast(); // Xóa typing indicator
           messages.add(newBotMessage);
 
           if (isNewConversation) {
             currentConversationId = convId;
-            _loadConversationsList();
           }
         });
 
+        // Lưu vào cache
+        if (_chatCache.containsKey(convId)) {
+          _chatCache[convId] = List.from(_chatCache[convId]!)
+            ..addAll([newUserMessage, newBotMessage]);
+        } else {
+          _chatCache[convId] = [newUserMessage, newBotMessage];
+        }
+
+        // Load lại conversations list nếu là conversation mới
+        if (isNewConversation) {
+          await _loadConversationsList();
+        }
+
         _scrollToBottom();
       } else if (mounted) {
+        // Xóa typing indicator và thêm message lỗi
         setState(() {
           messages.removeLast();
           messages.add({
@@ -260,6 +310,9 @@ class _ChatScreenState extends State<ChatScreen> {
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200 && mounted) {
+        // Xóa cache
+        _chatCache.remove(convId);
+
         await _loadConversationsList();
 
         if (convId == currentConversationId) {
@@ -316,6 +369,10 @@ class _ChatScreenState extends State<ChatScreen> {
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 200 && mounted) {
+        // Xóa cache
+        if (currentConversationId != null) {
+          _chatCache.remove(currentConversationId);
+        }
         setState(() => messages = []);
       }
     } catch (e) {
@@ -330,10 +387,8 @@ class _ChatScreenState extends State<ChatScreen> {
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
-        _scrollController.animateTo(
+        _scrollController.jumpTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
         );
       }
     });
@@ -435,57 +490,19 @@ class _ChatScreenState extends State<ChatScreen> {
                               itemBuilder: (context, index) {
                                 final msg = messages[index];
                                 final isUser = msg['isUser'] == true;
+                                final isTyping = msg['isTyping'] == true;
+
+                                if (isTyping) {
+                                  return _buildTypingIndicator();
+                                }
+
                                 return isUser
                                     ? _buildUserMessage(msg['text'])
                                     : _buildBotMessage(msg['text'], index == 0);
                               },
                             ),
 
-                  // Loading indicator - ở dưới cùng
-                  if (loading)
-                    Positioned(
-                      bottom: 16,
-                      left: 0,
-                      right: 0,
-                      child: Center(
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF7B00FF),
-                            borderRadius: BorderRadius.circular(20),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.1),
-                                blurRadius: 8,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
-                          ),
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Colors.white,
-                                ),
-                              ),
-                              SizedBox(width: 8),
-                              Text(
-                                "Thinking...",
-                                style: TextStyle(
-                                    color: Colors.white, fontSize: 12),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-
-                  // Sidebar - hiển thị trên cùng
+                  // Sidebar
                   if (showSidebar)
                     GestureDetector(
                       onTap: () => setState(() => showSidebar = false),
@@ -687,6 +704,42 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildTypingIndicator() {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 16, right: 50),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF7B00FF).withOpacity(0.1)),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 20,
+              height: 20,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Color(0xFF7B00FF),
+              ),
+            ),
+            SizedBox(width: 8),
+            Text(
+              "Thinking...",
+              style: TextStyle(
+                fontSize: 12,
+                color: Color(0xFF7B00FF),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
